@@ -21,6 +21,7 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
 import type { AskResult, RankedResult } from "./store.js";
+import { disposeDefaultLlamaCpp } from "./llm.js";
 
 // =============================================================================
 // Types for structured content
@@ -95,6 +96,36 @@ export async function startMcpServer(): Promise<void> {
   const server = new McpServer({
     name: "qmd",
     version: "1.0.0",
+  });
+
+  let _shutdownPromise: Promise<void> | null = null;
+  async function shutdownOnce(exitCode: number, reason: string): Promise<void> {
+    if (_shutdownPromise) return _shutdownPromise;
+
+    _shutdownPromise = (async () => {
+      try {
+        store.close();
+      } catch { /* ignore */ }
+
+      try {
+        await disposeDefaultLlamaCpp();
+      } catch (err) {
+        console.error(`Failed to dispose LLM during MCP shutdown (${reason}):`, err);
+      }
+    })();
+
+    void _shutdownPromise.finally(() => {
+      process.exit(exitCode);
+    });
+
+    return _shutdownPromise;
+  }
+
+  process.once("SIGINT", () => {
+    void shutdownOnce(130, "SIGINT");
+  });
+  process.once("SIGTERM", () => {
+    void shutdownOnce(143, "SIGTERM");
   });
 
   // ---------------------------------------------------------------------------
@@ -661,7 +692,17 @@ You can also access documents directly via the \`qmd://\` URI scheme:
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  // Note: Database stays open - it will be closed when the process exits
+  // Stdio transport closes when stdin ends (client disconnect). Ensure we cleanup.
+  // @ts-expect-error - Bun types may not include stdin 'once' helpers fully
+  process.stdin?.once?.("end", () => {
+    void shutdownOnce(0, "stdin_end");
+  });
+  // @ts-expect-error - Bun types may not include stdin 'once' helpers fully
+  process.stdin?.once?.("close", () => {
+    void shutdownOnce(0, "stdin_close");
+  });
+
+  // Note: Database stays open - it will be closed during shutdown
 }
 
 // Run if this is the main module

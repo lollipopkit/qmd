@@ -147,10 +147,6 @@ const cursor = {
   show() { process.stderr.write('\x1b[?25h'); },
 };
 
-// Ensure cursor is restored on exit
-process.on('SIGINT', () => { cursor.show(); process.exit(130); });
-process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
-
 // Terminal progress bar using OSC 9;4 escape sequence
 const progress = {
   set(percent: number) {
@@ -166,6 +162,62 @@ const progress = {
     process.stderr.write(`\x1b]9;4;2\x07`);
   },
 };
+
+// Ensure resources are released on exit/signals (avoid ggml-metal asserts)
+let _shutdownPromise: Promise<void> | null = null;
+
+async function shutdownOnce(exitCode: number, reason: string): Promise<void> {
+  if (_shutdownPromise) return _shutdownPromise;
+
+  _shutdownPromise = (async () => {
+    try {
+      cursor.show();
+      progress.clear();
+    } catch { /* ignore */ }
+
+    try {
+      closeDb();
+    } catch { /* ignore */ }
+
+    try {
+      await disposeDefaultLlamaCpp();
+    } catch (err) {
+      console.error(`Failed to dispose LLM during shutdown (${reason}):`, err);
+    }
+  })();
+
+  void _shutdownPromise.finally(() => {
+    process.exit(exitCode);
+  });
+
+  return _shutdownPromise;
+}
+
+function installSignalHandlers(): void {
+  process.once("SIGINT", () => {
+    void shutdownOnce(130, "SIGINT");
+    process.once("SIGINT", () => {
+      try {
+        cursor.show();
+        progress.clear();
+      } catch { /* ignore */ }
+      process.exit(130);
+    });
+  });
+
+  process.once("SIGTERM", () => {
+    void shutdownOnce(143, "SIGTERM");
+    process.once("SIGTERM", () => {
+      try {
+        cursor.show();
+        progress.clear();
+      } catch { /* ignore */ }
+      process.exit(143);
+    });
+  });
+}
+
+installSignalHandlers();
 
 // Format seconds into human-readable ETA
 function formatETA(seconds: number): string {
@@ -2744,5 +2796,7 @@ if (import.meta.main) {
     await disposeDefaultLlamaCpp();
     process.exit(0);
   }
+
+  // For MCP, keep process alive; cleanup is handled inside src/mcp.ts.
 
 } // end if (import.meta.main)

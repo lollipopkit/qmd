@@ -4,19 +4,49 @@
  * Provides embeddings, text generation, and reranking using local GGUF models.
  */
 
-import {
-  getLlama,
-  resolveModelFile,
-  LlamaChatSession,
-  LlamaLogLevel,
-  type Llama,
-  type LlamaModel,
-  type LlamaEmbeddingContext,
-  type Token as LlamaToken,
+import { dlopen, FFIType } from "bun:ffi";
+
+import type {
+  Llama,
+  LlamaModel,
+  LlamaEmbeddingContext,
+  Token as LlamaToken,
 } from "node-llama-cpp";
+
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync } from "fs";
+
+const _cstr = (s: string): Uint8Array => new TextEncoder().encode(s + "\0");
+
+const _libc = dlopen("libSystem.B.dylib", {
+  getenv: { args: [FFIType.cstring], returns: FFIType.cstring },
+  setenv: { args: [FFIType.cstring, FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
+});
+
+function getCEnv(name: string): string | null {
+  const v = _libc.symbols.getenv(_cstr(name));
+  const s = typeof v === "string" ? v : (v?.toString?.() ?? "");
+  return s.length > 0 ? s : null;
+}
+
+function setCEnvIfMissing(name: string, value: string): void {
+  if (getCEnv(name) !== null) return;
+  _libc.symbols.setenv(_cstr(name), _cstr(value), 0);
+}
+
+let _nodeLlamaCpp: typeof import("node-llama-cpp") | null = null;
+
+async function getNodeLlamaCpp(): Promise<typeof import("node-llama-cpp")> {
+  if (_nodeLlamaCpp) return _nodeLlamaCpp;
+
+  // Workaround for ggml-metal exit assert under Bun:
+  // ggml-metal reads this via libc getenv(), so we must set it with setenv().
+  setCEnvIfMissing("GGML_METAL_NO_RESIDENCY", "1");
+
+  _nodeLlamaCpp = await import("node-llama-cpp");
+  return _nodeLlamaCpp;
+}
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -394,7 +424,16 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      this.llama = await getLlama({ logLevel: LlamaLogLevel.error });
+      const gpuEnv = (process.env.QMD_LLAMA_GPU || "").toLowerCase();
+
+      // Optional: allow forcing CPU-only, but keep default behavior unchanged.
+      const forceCpu = (gpuEnv === "0" || gpuEnv === "false" || gpuEnv === "off");
+
+      const { getLlama, LlamaLogLevel } = await getNodeLlamaCpp();
+      this.llama = await getLlama({
+        logLevel: LlamaLogLevel.error,
+        ...(forceCpu ? { gpu: false } : {}),
+      });
     }
     return this.llama;
   }
@@ -404,6 +443,7 @@ export class LlamaCpp implements LLM {
    */
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
+    const { resolveModelFile } = await getNodeLlamaCpp();
     // resolveModelFile handles HF URIs and downloads to the cache dir
     return await resolveModelFile(modelUri, this.modelCacheDir);
   }
@@ -642,6 +682,7 @@ export class LlamaCpp implements LLM {
     // Create fresh context -> sequence -> session for each call
     const context = await this.generateModel!.createContext();
     const sequence = context.getSequence();
+    const { LlamaChatSession } = await getNodeLlamaCpp();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
     const maxTokens = options.maxTokens ?? 150;
@@ -752,6 +793,7 @@ Final Output:`;
     // Create fresh context for each call
     const genContext = await this.generateModel!.createContext();
     const sequence = genContext.getSequence();
+    const { LlamaChatSession } = await getNodeLlamaCpp();
     const session = new LlamaChatSession({ contextSequence: sequence });
 
     try {
@@ -838,22 +880,79 @@ Final Output:`;
       this.inactivityTimer = null;
     }
 
-    // Disposing llama cascades to models and contexts automatically
-    // See: https://node-llama-cpp.withcat.ai/guide/objects-lifecycle
-    // Note: llama.dispose() can hang indefinitely, so we use a timeout
-    if (this.llama) {
-      const disposePromise = this.llama.dispose();
-      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 1000));
-      await Promise.race([disposePromise, timeoutPromise]);
+    // Best-effort explicit disposal order to reduce native teardown races.
+    // (ggml-metal asserts are often triggered when native resources are freed during process teardown.)
+    if (this.embedContext) {
+      try {
+        await this.embedContext.dispose();
+      } catch (err) {
+        console.error("Failed to dispose embed context:", err);
+      } finally {
+        this.embedContext = null;
+      }
     }
 
-    // Clear references
-    this.embedContext = null;
-    this.rerankContext = null;
-    this.embedModel = null;
-    this.generateModel = null;
-    this.rerankModel = null;
-    this.llama = null;
+    if (this.rerankContext) {
+      try {
+        await this.rerankContext.dispose();
+      } catch (err) {
+        console.error("Failed to dispose rerank context:", err);
+      } finally {
+        this.rerankContext = null;
+      }
+    }
+
+    if (this.embedModel) {
+      try {
+        await this.embedModel.dispose();
+      } catch (err) {
+        console.error("Failed to dispose embed model:", err);
+      } finally {
+        this.embedModel = null;
+      }
+    }
+
+    if (this.generateModel) {
+      try {
+        await this.generateModel.dispose();
+      } catch (err) {
+        console.error("Failed to dispose generate model:", err);
+      } finally {
+        this.generateModel = null;
+      }
+    }
+
+    if (this.rerankModel) {
+      try {
+        await this.rerankModel.dispose();
+      } catch (err) {
+        console.error("Failed to dispose rerank model:", err);
+      } finally {
+        this.rerankModel = null;
+      }
+    }
+
+    const envTimeout = Number.parseInt(process.env.QMD_LLAMA_DISPOSE_TIMEOUT_MS || "", 10);
+    const disposeTimeoutMs = Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 10_000;
+
+    // Note: llama.dispose() can hang indefinitely in some environments; use a timeout.
+    if (this.llama) {
+      try {
+        const disposePromise = this.llama.dispose();
+        const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, disposeTimeoutMs));
+        const winner = await Promise.race([
+          disposePromise.then(() => "disposed" as const).catch(() => "error" as const),
+          timeoutPromise.then(() => "timeout" as const),
+        ]);
+        if (winner === "timeout") {
+          console.error(`llama.dispose() timed out after ${disposeTimeoutMs}ms; continuing shutdown`);
+        }
+      } catch (err) {
+        console.error("Failed to dispose llama:", err);
+      } finally {
+        this.llama = null;
+      }
+    }
 
     // Clear any in-flight load/create promises
     this.embedModelLoadPromise = null;

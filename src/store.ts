@@ -23,6 +23,7 @@ import {
   type Queryable,
   type QueryType,
   type RerankDocument,
+  type ILLMSession,
 } from "./llm";
 import {
   findContextForPath as collectionsFindContextForPath,
@@ -688,7 +689,7 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionId?: number) => Promise<SearchResult[]>;
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQueryTyped: (query: string, options?: { includeLexical?: boolean; context?: string; scope?: string }) => Promise<Queryable[]>;
@@ -775,7 +776,7 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
-    searchVec: (query: string, model: string, limit?: number, collectionId?: number) => searchVec(db, query, model, limit, collectionId),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string) => searchVec(db, query, model, limit, collectionName),
 
     // Query expansion & reranking
     expandQueryTyped: (query: string, options?: { includeLexical?: boolean; context?: string; scope?: string }) =>
@@ -1978,11 +1979,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionId?: number): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedding = await getEmbedding(query, model, true);
+  const embedding = await getEmbedding(query, model, true, session);
   if (!embedding) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
@@ -2021,9 +2022,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
   `;
   const params: string[] = [...hashSeqs];
 
-  if (collectionId) {
+  if (collectionName) {
     docSql += ` AND d.collection = ?`;
-    params.push(String(collectionId));
+    params.push(collectionName);
   }
 
   const docRows = db.prepare(docSql).all(...params) as {
@@ -2068,11 +2069,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean): Promise<number[] | null> {
-  const llm = getDefaultLlamaCpp();
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
-  const result = await llm.embed(formattedText, { model, isQuery });
+  const result = session
+    ? await session.embed(formattedText, { model, isQuery })
+    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 

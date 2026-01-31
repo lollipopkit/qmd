@@ -20,7 +20,7 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
-import type { RankedResult } from "./store.js";
+import type { AskResult, RankedResult } from "./store.js";
 
 // =============================================================================
 // Types for structured content
@@ -574,6 +574,50 @@ You can also access documents directly via the \`qmd://\` URI scheme:
       }
 
       return { content };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: ask (Agentic RAG)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "ask",
+    {
+      title: "Ask (Agentic RAG)",
+      description: "Answer a question using agentic RAG over your QMD index. Returns answer with citations and optional trace.",
+      inputSchema: {
+        query: z.string().describe("User question"),
+        collection: z.string().optional().describe("Restrict retrieval to a specific collection (local scope)"),
+        limit: z.number().optional().default(6).describe("Max evidence/citation items to return"),
+        maxSteps: z.number().optional().default(3).describe("Max agentic steps (bounded retries)"),
+        context: z.string().optional().describe("Extra context to guide query expansion/rewrite"),
+        dryRun: z.boolean().optional().default(false).describe("Retrieval only, do not generate answer"),
+        explain: z.boolean().optional().default(false).describe("Include trace/evidence for debugging"),
+        minScore: z.number().optional().default(0.35).describe("Minimum top score threshold to answer"),
+        bridgeCandidates: z.number().optional().describe("How many collections to search in bridge stage (auto if omitted)"),
+      },
+    },
+    async ({ query, collection, limit, maxSteps, context, dryRun, explain, minScore, bridgeCandidates }) => {
+      const result: AskResult = await store.ask(query, {
+        collection,
+        limit,
+        maxSteps,
+        context,
+        dryRun,
+        explain,
+        minScore,
+        bridgeCandidates,
+      });
+
+      const summary = result.status === "answered"
+        ? "Answered with citations."
+        : (result.status === "needs_more_context" ? "Need more context (evidence found, but insufficient confidence)." : "Abstain (no answer based on indexed documents).");
+
+      return {
+        content: [{ type: "text", text: summary }],
+        structuredContent: result,
+      };
     }
   );
 

@@ -794,6 +794,13 @@ Final Output:`;
 
 let defaultLlamaCpp: LlamaCpp | null = null;
 
+// Keep disposed instances referenced so Bun/JS GC finalizers don't run native cleanup
+// during garbage collection (can trigger NAPI GC-safety assertions in some runtimes).
+// This list is expected to stay small (mostly test suites disposing the singleton).
+const _disposedDefaultInstances: LlamaCpp[] = [];
+
+let _disposeDefaultPromise: Promise<void> | null = null;
+
 /**
  * Get the default LlamaCpp instance (creates one if needed)
  */
@@ -816,9 +823,24 @@ export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
  * Call this before process exit to prevent NAPI crashes.
  */
 export async function disposeDefaultLlamaCpp(): Promise<void> {
-  if (defaultLlamaCpp) {
-    await defaultLlamaCpp.dispose();
-    defaultLlamaCpp = null;
-  }
+  if (_disposeDefaultPromise) return _disposeDefaultPromise;
+
+  if (!defaultLlamaCpp) return;
+
+  // Serialize disposal and keep a strong reference to avoid GC finalizers running
+  // during collection (some native addons are not GC-safe in finalizers).
+  const inst = defaultLlamaCpp;
+  defaultLlamaCpp = null;
+  _disposedDefaultInstances.push(inst);
+
+  _disposeDefaultPromise = (async () => {
+    try {
+      await inst.dispose();
+    } finally {
+      _disposeDefaultPromise = null;
+    }
+  })();
+
+  return _disposeDefaultPromise;
 }
 

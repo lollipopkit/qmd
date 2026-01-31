@@ -187,6 +187,7 @@ import {
   getDocumentBody,
   findDocuments,
   getStatus,
+  ask,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
@@ -884,6 +885,16 @@ QMD is your on-device search engine for markdown knowledge bases.`;
         expect(typeof col.pattern).toBe("string");
         expect(typeof col.documents).toBe("number");
       }
+    });
+
+    test("ask returns structured result shape", async () => {
+      const store = createStore(testDbPath);
+      const result = await store.ask("readme", { dryRun: true, explain: true, limit: 3 });
+      expect(["answered", "needs_more_context", "abstain"]).toContain(result.status);
+      expect(Array.isArray(result.citations)).toBe(true);
+      // In explain mode, trace should exist
+      expect(result.trace && Array.isArray(result.trace.steps)).toBe(true);
+      store.close();
     });
   });
 });

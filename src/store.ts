@@ -20,6 +20,8 @@ import {
   getDefaultLlamaCpp,
   formatQueryForEmbedding,
   formatDocForEmbedding,
+  type Queryable,
+  type QueryType,
   type RerankDocument,
 } from "./llm";
 import {
@@ -54,6 +56,73 @@ export const CHUNK_OVERLAP_TOKENS = Math.floor(CHUNK_SIZE_TOKENS * 0.15);  // 12
 // Fallback char-based approximation for sync chunking (~4 chars per token)
 export const CHUNK_SIZE_CHARS = CHUNK_SIZE_TOKENS * 4;  // 3200 chars
 export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 480 chars
+
+// =============================================================================
+// Agentic RAG types
+// =============================================================================
+
+export type AskStatus = "answered" | "needs_more_context" | "abstain";
+
+export type AskCitation = {
+  docid: string; // "#abc123"
+  file: string;  // qmd://collection/path
+  lineStart: number;
+  lineEnd: number;
+  quote?: string;
+};
+
+export type EvidenceChunk = {
+  docid: string;
+  file: string;        // qmd://collection/path
+  displayPath: string; // collection/path
+  title: string;
+  source: "fts" | "vec";
+  score: number;
+  chunkPos?: number;
+  lineStart: number;
+  lineEnd: number;
+  text: string;
+};
+
+export type AskTraceStep = {
+  step: number;
+  scope: "local" | "bridge" | "global";
+  collection?: string;
+  query: string;
+  rewrittenContext?: string;
+  topScore?: number;
+  evidenceCount: number;
+  action: "retrieve" | "rewrite" | "escalate" | "answer" | "abstain";
+  note?: string;
+};
+
+export type AskTrace = {
+  steps: AskTraceStep[];
+};
+
+export type AskOptions = {
+  collection?: string;
+  context?: string;
+  limit?: number;
+  maxSteps?: number;
+  dryRun?: boolean;
+  explain?: boolean;
+  minScore?: number;
+
+  /**
+   * How many collections to include in the bridge stage.
+   * If omitted, it is chosen automatically (recall-oriented) based on local results and maxSteps.
+   */
+  bridgeCandidates?: number;
+};
+
+export type AskResult = {
+  status: AskStatus;
+  answer?: string;
+  citations: AskCitation[];
+  trace?: AskTrace;
+  evidence?: EvidenceChunk[];
+};
 
 // =============================================================================
 // Path utilities
@@ -622,8 +691,12 @@ export type Store = {
   searchVec: (query: string, model: string, limit?: number, collectionId?: number) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
+  expandQueryTyped: (query: string, options?: { includeLexical?: boolean; context?: string; scope?: string }) => Promise<Queryable[]>;
   expandQuery: (query: string, model?: string) => Promise<string[]>;
   rerank: (query: string, documents: { file: string; text: string }[], model?: string) => Promise<{ file: string; score: number }[]>;
+
+  // Agentic RAG
+  ask: (question: string, options?: AskOptions) => Promise<AskResult>;
 
   // Document retrieval
   findDocument: (filename: string, options?: { includeBody?: boolean }) => DocumentResult | DocumentNotFound;
@@ -705,8 +778,13 @@ export function createStore(dbPath?: string): Store {
     searchVec: (query: string, model: string, limit?: number, collectionId?: number) => searchVec(db, query, model, limit, collectionId),
 
     // Query expansion & reranking
+    expandQueryTyped: (query: string, options?: { includeLexical?: boolean; context?: string; scope?: string }) =>
+      expandQueryTyped(query, options, DEFAULT_QUERY_MODEL, db),
     expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string) => rerank(query, documents, model, db),
+
+    // Agentic RAG
+    ask: (question: string, options?: AskOptions) => ask(db, question, options),
 
     // Document retrieval
     findDocument: (filename: string, options?: { includeBody?: boolean }) => findDocument(db, filename, options),
@@ -2047,27 +2125,57 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<string[]> {
-  // Check cache first
-  const cacheKey = getCacheKey("expandQuery", { query, model });
+export async function expandQueryTyped(
+  query: string,
+  options: { includeLexical?: boolean; context?: string; scope?: string } = {},
+  model: string = DEFAULT_QUERY_MODEL,
+  db: Database
+): Promise<Queryable[]> {
+  const includeLexical = options.includeLexical ?? true;
+  const context = options.context;
+  const scope = options.scope;
+
+  // Cache first
+  const cacheKey = getCacheKey("expandQueryTyped", { query, model, includeLexical, context: context || "", scope: scope || "" });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
-    const lines = cached.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    return [query, ...lines.slice(0, 2)];
+    try {
+      const parsed = JSON.parse(cached) as Queryable[];
+      if (Array.isArray(parsed)) {
+        return parsed.filter((q): q is Queryable => !!q && typeof q.text === "string" && (q.type === "lex" || q.type === "vec" || q.type === "hyde"));
+      }
+    } catch {
+      // Ignore bad cache
+    }
   }
 
   const llm = getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
-  const results = await llm.expandQuery(query);
-  const queryTexts = results.map(r => r.text);
+  const results = await llm.expandQuery(query, { includeLexical, context });
 
-  // Cache the expanded queries (excluding original)
-  const expandedOnly = queryTexts.filter(t => t !== query);
-  if (expandedOnly.length > 0) {
-    setCachedResult(db, cacheKey, expandedOnly.join('\n'));
+  // Normalize + dedupe
+  const seen = new Set<string>();
+  const out: Queryable[] = [];
+  for (const r of results) {
+    const t = (r.text || "").trim();
+    if (!t) continue;
+    const key = `${r.type}:${t}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ type: r.type as QueryType, text: t });
   }
 
-  return Array.from(new Set([query, ...queryTexts]));
+  // Cache JSON
+  setCachedResult(db, cacheKey, JSON.stringify(out));
+  return out;
+}
+
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<string[]> {
+  // Preserve legacy behavior: original query + up to 2 cached lines.
+  // The typed expansion is used by agentic ask and future pipelines.
+  const typed = await expandQueryTyped(query, { includeLexical: true }, model, db);
+  const queries = new Set<string>([query]);
+  for (const q of typed) queries.add(q.text);
+  return Array.from(queries);
 }
 
 // =============================================================================
@@ -2172,6 +2280,425 @@ type DbDocRow = {
   body_length: number;
   body?: string;
 };
+
+// =============================================================================
+// Agentic RAG (ask)
+// =============================================================================
+
+type RetrievalStats = {
+  hasVectors: boolean;
+  topFtsScore: number;
+  topVecScore: number;
+  fusedCount: number;
+  effectiveCollection?: string;
+  bridgeCandidates?: number;
+};
+
+function clampInt(n: number, min: number, max: number): number {
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+function isNonEmptyString(s: unknown): s is string {
+  return typeof s === "string" && s.trim().length > 0;
+}
+
+function lineStartFromChunkPos(body: string, chunkPos?: number): number {
+  if (!chunkPos || chunkPos <= 0) return 1;
+  const before = body.slice(0, Math.min(chunkPos, body.length));
+  return before.split("\n").length;
+}
+
+function pickBridgeCollections(
+  db: Database,
+  opts: {
+    localCollection?: string;
+    desiredCandidates?: number;
+  }
+): string[] {
+  const desired = clampInt(opts.desiredCandidates ?? 12, 1, 50);
+
+  // Use DB stats for recall-oriented candidate list (most docs first).
+  const collections = listCollections(db)
+    .filter(c => !!c.name)
+    .sort((a, b) => b.active_count - a.active_count)
+    .map(c => c.name);
+
+  // Put local collection first (if any), then the rest.
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (name: string) => {
+    if (!name) return;
+    if (seen.has(name)) return;
+    seen.add(name);
+    out.push(name);
+  };
+
+  if (opts.localCollection) add(opts.localCollection);
+  for (const name of collections) {
+    add(name);
+    if (out.length >= desired) break;
+  }
+
+  return out;
+}
+
+function evidenceFromSearchResult(res: SearchResult, query: string): EvidenceChunk {
+  const body = res.body || "";
+  const snippetRes = extractSnippet(body, query, 800, res.chunkPos);
+  const lineStart = res.source === "vec"
+    ? lineStartFromChunkPos(body, res.chunkPos)
+    : snippetRes.line;
+  const lineEnd = lineStart + Math.max(0, snippetRes.snippetLines - 1);
+
+  // Remove @@ header line for the quote/snippet body (keep readable citation text)
+  const snippetLines = snippetRes.snippet.split("\n");
+  const quote = snippetLines.length > 1 ? snippetLines.slice(1).join("\n") : snippetRes.snippet;
+
+  return {
+    docid: `#${res.docid}`,
+    file: res.filepath,
+    displayPath: res.displayPath,
+    title: res.title,
+    source: res.source,
+    score: res.score,
+    chunkPos: res.chunkPos,
+    lineStart,
+    lineEnd: Math.max(lineStart, lineEnd),
+    text: quote,
+  };
+}
+
+function citationsFromEvidence(evidence: EvidenceChunk[], maxCitations: number): AskCitation[] {
+  const out: AskCitation[] = [];
+  for (const e of evidence.slice(0, maxCitations)) {
+    out.push({
+      docid: e.docid,
+      file: e.file,
+      lineStart: e.lineStart,
+      lineEnd: e.lineEnd,
+      quote: e.text,
+    });
+  }
+  return out;
+}
+
+async function retrieveOnce(
+  db: Database,
+  question: string,
+  scope: "local" | "bridge" | "global",
+  opts: {
+    collection?: string;
+    context?: string;
+    limit: number;
+    disableLLM: boolean;
+    bridgeCandidatesDesired: number;
+  }
+): Promise<{ evidence: EvidenceChunk[]; stats: RetrievalStats; queryUsed: string }>
+{
+  const hasVectors = !!db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+
+  // Scope rules (no KG):
+  // - local: restrict to collection if provided; otherwise behave like global.
+  // - bridge: search across a broad set of candidate collections (recall-oriented).
+  // - global: search across all collections.
+  //
+  // Note: `searchFTS/searchVec` only support single-collection filtering (legacy param),
+  // so bridge/global are implemented by running per-collection searches and merging.
+  const collectionFilter = scope === "local" ? opts.collection : undefined;
+  const bridgeCollections = scope === "bridge"
+    ? pickBridgeCollections(db, { localCollection: opts.collection, desiredCandidates: opts.bridgeCandidatesDesired })
+    : [];
+
+  // Deterministic / no-LLM mode: BM25 only.
+  // This avoids model downloads and non-determinism, and is used by `ask --dry-run`.
+  if (opts.disableLLM) {
+    const fts = searchFTS(db, question, Math.max(20, opts.limit * 3), collectionFilter as any);
+    const evidence = fts.slice(0, opts.limit).map(r => evidenceFromSearchResult(r, question));
+    const topScore = evidence[0]?.score ?? 0;
+    return {
+      evidence,
+      stats: { hasVectors: false, topFtsScore: topScore, topVecScore: 0, fusedCount: evidence.length, effectiveCollection: collectionFilter, bridgeCandidates: 0 },
+      queryUsed: question,
+    };
+  }
+
+  // Typed expansion so we can route lex vs vec/hyde.
+  const queryables = await expandQueryTyped(
+    question,
+    { includeLexical: true, context: opts.context, scope },
+    DEFAULT_QUERY_MODEL,
+    db
+  );
+
+  const ftsQueries: string[] = [question];
+  const vecQueries: string[] = [question];
+  for (const q of queryables) {
+    if (!q.text || q.text === question) continue;
+    if (q.type === "lex") ftsQueries.push(q.text);
+    if (q.type === "vec" || q.type === "hyde") vecQueries.push(q.text);
+  }
+
+  const rankedLists: SearchResult[][] = [];
+
+  if (scope === "bridge") {
+    // Recall-oriented bridge search: run across many collections, sequentially.
+    // This can be expensive but is bounded by `bridgeCollections` size and query variation counts.
+    for (const col of bridgeCollections) {
+      for (const q of ftsQueries) {
+        const rs = searchFTS(db, q, 20, col as any);
+        if (rs.length > 0) rankedLists.push(rs);
+      }
+
+      if (hasVectors) {
+        for (const q of vecQueries) {
+          const rs = await searchVec(db, q, DEFAULT_EMBED_MODEL, 20, col as any);
+          if (rs.length > 0) rankedLists.push(rs);
+        }
+      }
+    }
+  } else {
+    // local/global single-collection (or unfiltered) search.
+    // Run FTS first (sync)
+    for (const q of ftsQueries) {
+      const rs = searchFTS(db, q, 20, collectionFilter as any);
+      if (rs.length > 0) rankedLists.push(rs);
+    }
+
+    // Vector searches: run sequentially to avoid concurrent embed() hangs.
+    if (hasVectors) {
+      for (const q of vecQueries) {
+        const rs = await searchVec(db, q, DEFAULT_EMBED_MODEL, 20, collectionFilter as any);
+        if (rs.length > 0) rankedLists.push(rs);
+      }
+    }
+  }
+
+  if (rankedLists.length === 0) {
+    return {
+      evidence: [],
+      stats: { hasVectors, topFtsScore: 0, topVecScore: 0, fusedCount: 0, effectiveCollection: collectionFilter, bridgeCandidates: scope === "bridge" ? bridgeCollections.length : 0 },
+      queryUsed: question,
+    };
+  }
+
+  // Convert to RankedResult lists for RRF
+  const rrfLists: RankedResult[][] = rankedLists.map(list =>
+    list.map(r => ({ file: r.filepath, displayPath: r.displayPath, title: r.title, body: r.body || "", score: r.score }))
+  );
+  const weights = rrfLists.map((_, i) => (i < 2 ? 2.0 : 1.0));
+  const fused = reciprocalRankFusion(rrfLists, weights);
+
+  // Rerank best chunk per doc (use existing rerank helper; it caches).
+  const RERANK_DOC_LIMIT = Math.min(40, fused.length);
+  const candidates = fused.slice(0, RERANK_DOC_LIMIT);
+
+  const docMap = new Map<string, { displayPath: string; title: string; body: string; score: number }>();
+  for (const c of candidates) {
+    docMap.set(c.file, { displayPath: c.displayPath, title: c.title, body: c.body, score: c.score });
+  }
+
+  const chunksToRerank: { file: string; text: string; chunkPos: number }[] = [];
+  for (const [file, c] of docMap.entries()) {
+    const chunks = chunkDocument(c.body);
+    const chunk = chunks[0] || { text: c.body, pos: 0 };
+    chunksToRerank.push({ file, text: chunk.text, chunkPos: chunk.pos });
+  }
+
+  const reranked = await rerank(
+    question,
+    chunksToRerank.map(x => ({ file: x.file, text: x.text })),
+    DEFAULT_RERANK_MODEL,
+    db
+  );
+
+  const rerankScoreMap = new Map(reranked.map(r => [r.file, r.score]));
+  const final = candidates
+    .map((c, idx) => {
+      const rScore = rerankScoreMap.get(c.file) ?? 0;
+      const rrfRank = idx + 1;
+      const rrfScore = 1 / rrfRank;
+      // Similar blending as CLI/MCP (top ranks keep more retrieval influence)
+      const rrfWeight = rrfRank <= 3 ? 0.75 : (rrfRank <= 10 ? 0.60 : 0.40);
+      const score = rrfWeight * rrfScore + (1 - rrfWeight) * rScore;
+      return {
+        filepath: c.file,
+        displayPath: c.displayPath,
+        title: c.title,
+        body: c.body,
+        hash: "",
+        docid: "",
+        collectionName: "",
+        modifiedAt: "",
+        bodyLength: c.body.length,
+        context: getContextForFile(db, c.file),
+        score,
+        source: "fts" as const,
+      } satisfies SearchResult;
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, opts.limit);
+
+  // Rehydrate docid/source/chunkPos by looking up from the underlying lists where possible.
+  const byFile = new Map<string, SearchResult>();
+  for (const list of rankedLists) {
+    for (const r of list) {
+      if (!byFile.has(r.filepath)) byFile.set(r.filepath, r);
+    }
+  }
+
+  const evidence = final.map(r => {
+    const base = byFile.get(r.filepath);
+    const merged: SearchResult = base ? { ...base, score: r.score } : r;
+    return evidenceFromSearchResult(merged, question);
+  });
+
+  const topScore = evidence[0]?.score ?? 0;
+
+  return {
+    evidence,
+    stats: {
+      hasVectors,
+      topFtsScore: topScore,
+      topVecScore: topScore,
+      fusedCount: evidence.length,
+      effectiveCollection: collectionFilter,
+      bridgeCandidates: scope === "bridge" ? bridgeCollections.length : 0,
+    },
+    queryUsed: question,
+  };
+}
+
+function shouldAbstain(question: string): boolean {
+  const q = question.trim();
+  return q.length === 0;
+}
+
+function shouldAnswerFromEvidence(evidence: EvidenceChunk[], minScore: number): boolean {
+  const top = evidence[0];
+  if (!top) return false;
+  return top.score >= minScore;
+}
+
+async function generateAnswerFromEvidence(question: string, evidence: EvidenceChunk[]): Promise<{ answer: string; citations: AskCitation[] } | null> {
+  const llm = getDefaultLlamaCpp();
+
+  const evidenceBlock = evidence.slice(0, 6).map((e, i) => {
+    const header = `[E${i + 1}] ${e.docid} ${e.file}:${e.lineStart}-${e.lineEnd} ${e.title}`;
+    return `${header}\n${e.text}`;
+  }).join("\n\n");
+
+  const prompt = `You are answering a question using ONLY the provided evidence excerpts.
+
+Question: ${question}
+
+Evidence:
+${evidenceBlock}
+
+Rules:
+- If evidence is insufficient, say "I don't know based on the indexed documents." and do not hallucinate.
+- Keep answer concise.
+
+Answer:`;
+
+  const gen = await llm.generate(prompt, { maxTokens: 350, temperature: 0 });
+  if (!gen || !isNonEmptyString(gen.text)) return null;
+
+  const answer = gen.text.trim();
+  const citations = citationsFromEvidence(evidence, 4);
+  return { answer, citations };
+}
+
+export async function ask(db: Database, question: string, options: AskOptions = {}): Promise<AskResult> {
+  const limit = clampInt(options.limit ?? 6, 1, 20);
+  const maxSteps = clampInt(options.maxSteps ?? 3, 1, 6);
+  const minScore = options.minScore ?? 0.35;
+
+  if (shouldAbstain(question)) {
+    return { status: "abstain", citations: [], trace: options.explain ? { steps: [{ step: 1, scope: "local", query: question, evidenceCount: 0, action: "abstain", note: "empty query" }] } : undefined };
+  }
+
+  const trace: AskTraceStep[] = [];
+  const scopes: ("local" | "bridge" | "global")[] = ["local", "bridge", "global"];
+  let lastEvidence: EvidenceChunk[] = [];
+
+  for (let step = 0; step < maxSteps; step++) {
+    const scope = scopes[Math.min(step, scopes.length - 1)]!;
+
+    const effectiveBridgeCandidates = (() => {
+      if (typeof options.bridgeCandidates === "number" && Number.isFinite(options.bridgeCandidates)) {
+        return clampInt(options.bridgeCandidates, 1, 50);
+      }
+
+      // Auto-tune (recall-oriented): if local collection is set, we assume user wants more coverage.
+      // Also scale a bit with maxSteps.
+      const base = options.collection ? 20 : 12;
+      const scaled = base + Math.max(0, maxSteps - 3) * 6;
+      return clampInt(scaled, 8, 50);
+    })();
+
+    const { evidence, queryUsed } = await retrieveOnce(db, question, scope, {
+      collection: options.collection,
+      context: options.context,
+      limit,
+      disableLLM: !!options.dryRun,
+      bridgeCandidatesDesired: effectiveBridgeCandidates,
+    });
+
+    lastEvidence = evidence;
+    trace.push({
+      step: step + 1,
+      scope,
+      collection: options.collection,
+      query: queryUsed,
+      evidenceCount: evidence.length,
+      topScore: evidence[0]?.score ?? 0,
+      action: "retrieve",
+    });
+
+    if (!evidence.length) {
+      trace.push({ step: step + 1, scope, collection: options.collection, query: queryUsed, evidenceCount: 0, action: "escalate", note: "no evidence" });
+      continue;
+    }
+
+    if (!shouldAnswerFromEvidence(evidence, minScore)) {
+      trace.push({ step: step + 1, scope, collection: options.collection, query: queryUsed, evidenceCount: evidence.length, topScore: evidence[0]?.score ?? 0, action: "escalate", note: `topScore<minScore(${minScore})` });
+      continue;
+    }
+
+    // At this point, we have evidence. In dry-run, return without LLM generation.
+    if (options.dryRun) {
+      return {
+        status: "needs_more_context",
+        citations: citationsFromEvidence(evidence, 6),
+        trace: options.explain ? { steps: trace } : undefined,
+        evidence,
+      };
+    }
+
+    const generated = await generateAnswerFromEvidence(question, evidence);
+    if (!generated) {
+      trace.push({ step: step + 1, scope, collection: options.collection, query: queryUsed, evidenceCount: evidence.length, action: "rewrite", note: "generation failed" });
+      continue;
+    }
+
+    return {
+      status: "answered",
+      answer: generated.answer,
+      citations: generated.citations,
+      trace: options.explain ? { steps: trace } : undefined,
+      evidence: options.explain ? evidence : undefined,
+    };
+  }
+
+  // Bounded retries exhausted
+  return {
+    status: lastEvidence.length ? "needs_more_context" : "abstain",
+    citations: citationsFromEvidence(lastEvidence, 6),
+    trace: options.explain ? { steps: trace } : undefined,
+    evidence: options.explain ? lastEvidence : undefined,
+  };
+}
 
 /**
  * Find a document by filename/path, docid (#hash), or with fuzzy matching.

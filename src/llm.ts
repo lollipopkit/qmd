@@ -19,20 +19,45 @@ import { existsSync, mkdirSync } from "fs";
 
 const _cstr = (s: string): Uint8Array => new TextEncoder().encode(s + "\0");
 
-const _libc = dlopen("libSystem.B.dylib", {
-  getenv: { args: [FFIType.cstring], returns: FFIType.cstring },
-  setenv: { args: [FFIType.cstring, FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
-});
+type LibC = {
+  symbols: {
+    getenv: (name: Uint8Array) => unknown;
+    setenv: (name: Uint8Array, value: Uint8Array, overwrite: number) => number;
+  };
+};
+
+let _libc: LibC | null = null;
+
+if (process.platform === "darwin") {
+  try {
+    _libc = dlopen("libSystem.B.dylib", {
+      getenv: { args: [FFIType.cstring], returns: FFIType.cstring },
+      setenv: { args: [FFIType.cstring, FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
+    }) as unknown as LibC;
+  } catch {
+    _libc = null;
+  }
+}
 
 function getCEnv(name: string): string | null {
-  const v = _libc.symbols.getenv(_cstr(name));
-  const s = typeof v === "string" ? v : (v?.toString?.() ?? "");
+  if (_libc) {
+    const v = _libc.symbols.getenv(_cstr(name));
+    const s = typeof v === "string" ? v : (v?.toString?.() ?? "");
+    return s.length > 0 ? s : null;
+  }
+
+  const s = process.env[name] ?? "";
   return s.length > 0 ? s : null;
 }
 
 function setCEnvIfMissing(name: string, value: string): void {
   if (getCEnv(name) !== null) return;
-  _libc.symbols.setenv(_cstr(name), _cstr(value), 0);
+
+  if (_libc) {
+    _libc.symbols.setenv(_cstr(name), _cstr(value), 0);
+  } else if (process.env[name] === undefined) {
+    process.env[name] = value;
+  }
 }
 
 let _nodeLlamaCpp: typeof import("node-llama-cpp") | null = null;

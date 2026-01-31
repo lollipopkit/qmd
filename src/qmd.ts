@@ -2711,7 +2711,11 @@ if (import.meta.main) {
         dryRun: !!cli.opts.dryRun,
         explain: !!cli.opts.explain,
         minScore: cli.opts.minScore,
-        bridgeCandidates: cli.values["bridge-candidates"] ? parseInt(String(cli.values["bridge-candidates"]), 10) : undefined,
+        bridgeCandidates: (() => {
+          if (!cli.values["bridge-candidates"]) return undefined;
+          const n = Number.parseInt(String(cli.values["bridge-candidates"]), 10);
+          return Number.isFinite(n) ? n : undefined;
+        })(),
       };
 
       const result = await store.ask(cli.query, askOpts);

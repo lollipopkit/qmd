@@ -20,7 +20,8 @@ import {
   DEFAULT_RERANK_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
 } from "./store.js";
-import type { RankedResult } from "./store.js";
+import type { AskResult, RankedResult } from "./store.js";
+import { disposeDefaultLlamaCpp } from "./llm.js";
 
 // =============================================================================
 // Types for structured content
@@ -95,6 +96,36 @@ export async function startMcpServer(): Promise<void> {
   const server = new McpServer({
     name: "qmd",
     version: "1.0.0",
+  });
+
+  let _shutdownPromise: Promise<void> | null = null;
+  async function shutdownOnce(exitCode: number, reason: string): Promise<void> {
+    if (_shutdownPromise) return _shutdownPromise;
+
+    _shutdownPromise = (async () => {
+      try {
+        store.close();
+      } catch { /* ignore */ }
+
+      try {
+        await disposeDefaultLlamaCpp();
+      } catch (err) {
+        console.error(`Failed to dispose LLM during MCP shutdown (${reason}):`, err);
+      }
+    })();
+
+    void _shutdownPromise.finally(() => {
+      process.exit(exitCode);
+    });
+
+    return _shutdownPromise;
+  }
+
+  process.once("SIGINT", () => {
+    void shutdownOnce(130, "SIGINT");
+  });
+  process.once("SIGTERM", () => {
+    void shutdownOnce(143, "SIGTERM");
   });
 
   // ---------------------------------------------------------------------------
@@ -578,6 +609,50 @@ You can also access documents directly via the \`qmd://\` URI scheme:
   );
 
   // ---------------------------------------------------------------------------
+  // Tool: ask (Agentic RAG)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "ask",
+    {
+      title: "Ask (Agentic RAG)",
+      description: "Answer a question using agentic RAG over your QMD index. Returns answer with citations and optional trace.",
+      inputSchema: {
+        query: z.string().describe("User question"),
+        collection: z.string().optional().describe("Restrict retrieval to a specific collection (local scope)"),
+        limit: z.number().optional().default(6).describe("Max evidence/citation items to return"),
+        maxSteps: z.number().optional().default(3).describe("Max agentic steps (bounded retries)"),
+        context: z.string().optional().describe("Extra context to guide query expansion/rewrite"),
+        dryRun: z.boolean().optional().default(false).describe("Retrieval only, do not generate answer"),
+        explain: z.boolean().optional().default(false).describe("Include trace/evidence for debugging"),
+        minScore: z.number().optional().default(0.35).describe("Minimum top score threshold to answer"),
+        bridgeCandidates: z.number().optional().describe("How many collections to search in bridge stage (auto if omitted)"),
+      },
+    },
+    async ({ query, collection, limit, maxSteps, context, dryRun, explain, minScore, bridgeCandidates }) => {
+      const result: AskResult = await store.ask(query, {
+        collection,
+        limit,
+        maxSteps,
+        context,
+        dryRun,
+        explain,
+        minScore,
+        bridgeCandidates,
+      });
+
+      const summary = result.status === "answered"
+        ? "Answered with citations."
+        : (result.status === "needs_more_context" ? "Need more context (evidence found, but insufficient confidence)." : "Abstain (no answer based on indexed documents).");
+
+      return {
+        content: [{ type: "text", text: summary }],
+        structuredContent: result,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
   // Tool: qmd_status (Index status)
   // ---------------------------------------------------------------------------
 
@@ -617,7 +692,17 @@ You can also access documents directly via the \`qmd://\` URI scheme:
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  // Note: Database stays open - it will be closed when the process exits
+  // Stdio transport closes when stdin ends (client disconnect). Ensure we cleanup.
+  // @ts-expect-error - Bun types may not include stdin 'once' helpers fully
+  process.stdin?.once?.("end", () => {
+    void shutdownOnce(0, "stdin_end");
+  });
+  // @ts-expect-error - Bun types may not include stdin 'once' helpers fully
+  process.stdin?.once?.("close", () => {
+    void shutdownOnce(0, "stdin_close");
+  });
+
+  // Note: Database stays open - it will be closed during shutdown
 }
 
 // Run if this is the main module

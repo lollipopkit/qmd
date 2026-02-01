@@ -64,6 +64,7 @@ import {
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
   getDefaultDbPath,
+  type AskOptions,
 } from "./store.js";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp, withLLMSession, type ILLMSession, type RerankDocument, type Queryable, type QueryType } from "./llm.js";
 import type { SearchResult, RankedResult } from "./store.js";
@@ -146,10 +147,6 @@ const cursor = {
   show() { process.stderr.write('\x1b[?25h'); },
 };
 
-// Ensure cursor is restored on exit
-process.on('SIGINT', () => { cursor.show(); process.exit(130); });
-process.on('SIGTERM', () => { cursor.show(); process.exit(143); });
-
 // Terminal progress bar using OSC 9;4 escape sequence
 const progress = {
   set(percent: number) {
@@ -165,6 +162,62 @@ const progress = {
     process.stderr.write(`\x1b]9;4;2\x07`);
   },
 };
+
+// Ensure resources are released on exit/signals (avoid ggml-metal asserts)
+let _shutdownPromise: Promise<void> | null = null;
+
+async function shutdownOnce(exitCode: number, reason: string): Promise<void> {
+  if (_shutdownPromise) return _shutdownPromise;
+
+  _shutdownPromise = (async () => {
+    try {
+      cursor.show();
+      progress.clear();
+    } catch { /* ignore */ }
+
+    try {
+      closeDb();
+    } catch { /* ignore */ }
+
+    try {
+      await disposeDefaultLlamaCpp();
+    } catch (err) {
+      console.error(`Failed to dispose LLM during shutdown (${reason}):`, err);
+    }
+  })();
+
+  void _shutdownPromise.finally(() => {
+    process.exit(exitCode);
+  });
+
+  return _shutdownPromise;
+}
+
+function installSignalHandlers(): void {
+  process.once("SIGINT", () => {
+    void shutdownOnce(130, "SIGINT");
+    process.once("SIGINT", () => {
+      try {
+        cursor.show();
+        progress.clear();
+      } catch { /* ignore */ }
+      process.exit(130);
+    });
+  });
+
+  process.once("SIGTERM", () => {
+    void shutdownOnce(143, "SIGTERM");
+    process.once("SIGTERM", () => {
+      try {
+        cursor.show();
+        progress.clear();
+      } catch { /* ignore */ }
+      process.exit(143);
+    });
+  });
+}
+
+installSignalHandlers();
 
 // Format seconds into human-readable ETA
 function formatETA(seconds: number): string {
@@ -1757,6 +1810,8 @@ type OutputOptions = {
   collection?: string;  // Filter by collection name (pwd suffix match)
   lineNumbers?: boolean; // Add line numbers to output
   context?: string;      // Optional context for query expansion
+  dryRun?: boolean;
+  explain?: boolean;
 };
 
 // Highlight query terms in text (skip short words < 3 chars)
@@ -2294,6 +2349,12 @@ function parseCLI() {
       context: {
         type: "string",
       },
+      "dry-run": {
+        type: "boolean",
+      },
+      explain: {
+        type: "boolean",
+      },
       "no-lex": {
         type: "boolean",
       },
@@ -2301,6 +2362,8 @@ function parseCLI() {
       // Search options
       n: { type: "string" },
       "min-score": { type: "string" },
+      "max-steps": { type: "string" },
+      "bridge-candidates": { type: "string" },
       all: { type: "boolean" },
       full: { type: "boolean" },
       csv: { type: "boolean" },
@@ -2353,6 +2416,9 @@ function parseCLI() {
     all: isAll,
     collection: values.collection as string | undefined,
     lineNumbers: !!values["line-numbers"],
+    context: values.context as string | undefined,
+    dryRun: !!values["dry-run"],
+    explain: !!values.explain,
   };
 
   return {
@@ -2383,10 +2449,12 @@ function showHelp(): void {
   console.log("  qmd search <query>            - Full-text search (BM25)");
   console.log("  qmd vsearch <query>           - Vector similarity search");
   console.log("  qmd query <query>             - Combined search with query expansion + reranking");
+  console.log("  qmd ask <query>               - Agentic RAG: answer with citations (use --dry-run/--explain/--json)");
   console.log("  qmd mcp                       - Start MCP server (for AI agent integration)");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
+  console.log("  --context <text>           - Extra context for query expansion / ask");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Number of results (default: 5, or 20 for --files)");
@@ -2396,6 +2464,10 @@ function showHelp(): void {
   console.log("  --line-numbers             - Add line numbers to output");
   console.log("  --files                    - Output docid,score,filepath,context (default: 20 results)");
   console.log("  --json                     - JSON output with snippets (default: 20 results)");
+  console.log("  --dry-run                  - (ask) Do retrieval only; do not generate answer");
+  console.log("  --explain                  - (ask) Include decision trace and evidence in JSON");
+  console.log("  --max-steps <num>           - (ask) Bounded retries (default: 3)");
+  console.log("  --bridge-candidates <num>   - (ask) How many collections to search in bridge stage (auto if omitted)");
   console.log("  --csv                      - CSV output with snippets");
   console.log("  --md                       - Markdown output");
   console.log("  --xml                      - XML output");
@@ -2409,7 +2481,7 @@ function showHelp(): void {
   console.log("Models (auto-downloaded from HuggingFace):");
   console.log("  Embedding: embeddinggemma-300M-Q8_0");
   console.log("  Reranking: qwen3-reranker-0.6b-q8_0");
-  console.log("  Generation: Qwen3-0.6B-Q8_0");
+  console.log("  Generation: Qwen3-1.7B-Q8_0");
   console.log("");
   console.log(`Index: ${getDbPath()}`);
 }
@@ -2623,6 +2695,66 @@ if (import.meta.main) {
       await querySearch(cli.query, cli.opts);
       break;
 
+    case "ask": {
+      if (!cli.query) {
+        console.error("Usage: qmd ask [options] <query>");
+        process.exit(1);
+      }
+
+      const store = getStore();
+
+      const askOpts: AskOptions = {
+        collection: cli.opts.collection,
+        context: cli.opts.context,
+        limit: cli.opts.limit,
+        maxSteps: (cli.values["max-steps"] ? parseInt(String(cli.values["max-steps"]), 10) : 3) || 3,
+        dryRun: !!cli.opts.dryRun,
+        explain: !!cli.opts.explain,
+        minScore: cli.opts.minScore,
+        bridgeCandidates: (() => {
+          if (!cli.values["bridge-candidates"]) return undefined;
+          const n = Number.parseInt(String(cli.values["bridge-candidates"]), 10);
+          return Number.isFinite(n) ? n : undefined;
+        })(),
+      };
+
+      const result = await store.ask(cli.query, askOpts);
+
+      if (cli.opts.format === "json") {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        if (result.status === "answered" && result.answer) {
+          console.log(result.answer);
+          console.log();
+        } else if (result.status === "needs_more_context") {
+          console.log("Need more context to answer based on current evidence.");
+          console.log();
+        } else {
+          console.log("Abstain: no answer based on indexed documents.");
+          console.log();
+        }
+
+        if (result.citations.length > 0) {
+          console.log("Citations:");
+          for (const c of result.citations) {
+            console.log(`- ${c.docid} ${c.file}:${c.lineStart}-${c.lineEnd}`);
+          }
+        }
+
+        if (cli.opts.explain && result.trace) {
+          console.log();
+          console.log("Trace:");
+          for (const s of result.trace.steps) {
+            const extra = s.note ? ` (${s.note})` : "";
+            console.log(`- step ${s.step}: ${s.scope} ${s.action} evidence=${s.evidenceCount} top=${(s.topScore ?? 0).toFixed(2)}${extra}`);
+          }
+        }
+      }
+
+      closeDb();
+      break;
+    }
+
     case "mcp": {
       const { startMcpServer } = await import("./mcp.js");
       await startMcpServer();
@@ -2668,5 +2800,7 @@ if (import.meta.main) {
     await disposeDefaultLlamaCpp();
     process.exit(0);
   }
+
+  // For MCP, keep process alive; cleanup is handled inside src/mcp.ts.
 
 } // end if (import.meta.main)

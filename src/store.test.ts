@@ -1905,6 +1905,19 @@ describe("LlamaCpp Integration", () => {
     await cleanupTestDb(store);
   }, 30000);
 
+  test("expandQueryTyped returns typed queryables", async () => {
+    const store = await createTestStore();
+
+    const qs = await store.expandQueryTyped("test query", { includeLexical: true, context: "", scope: "local" });
+    expect(Array.isArray(qs)).toBe(true);
+    if (qs.length > 0) {
+      expect(["lex", "vec", "hyde"]).toContain(qs[0]!.type);
+      expect(typeof qs[0]!.text).toBe("string");
+    }
+
+    await cleanupTestDb(store);
+  }, 30000);
+
   test("expandQuery caches results", async () => {
     const store = await createTestStore();
 

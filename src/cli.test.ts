@@ -462,6 +462,15 @@ describe("CLI Output Formats", () => {
     expect(stdout).toContain(".md");
   });
 
+  test("ask with --json flag outputs JSON", async () => {
+    // Use dry-run to avoid requiring generation model for this test.
+    const { stdout, exitCode } = await runQmd(["ask", "--json", "--dry-run", "test"]);
+    expect(exitCode).toBe(0);
+    const parsed = JSON.parse(stdout);
+    expect(typeof parsed.status).toBe("string");
+    expect(Array.isArray(parsed.citations)).toBe(true);
+  });
+
   test("search output includes snippets by default", async () => {
     const { stdout, exitCode } = await runQmd(["search", "API"]);
     expect(exitCode).toBe(0);

@@ -28,6 +28,11 @@ qmd search "project timeline"           # Fast keyword search
 qmd vsearch "how to deploy"             # Semantic search
 qmd query "quarterly planning process"  # Hybrid + reranking (best quality)
 
+# Ask (agentic RAG) - answer with citations
+qmd ask "What is the quarterly planning process?" --json
+qmd ask "How do we deploy?" --json --dry-run --explain
+qmd ask "How do we deploy?" --json --bridge-candidates 30
+
 # Get a specific document
 qmd get "meetings/2024-01-15.md"
 
@@ -64,12 +69,24 @@ qmd get "docs/api-reference.md" --full
 Although the tool works perfectly fine when you just tell your agent to use it on the command line, it also exposes an MCP (Model Context Protocol) server for tighter integration.
 
 **Tools exposed:**
-- `qmd_search` - Fast BM25 keyword search (supports collection filter)
-- `qmd_vsearch` - Semantic vector search (supports collection filter)
-- `qmd_query` - Hybrid search with reranking (supports collection filter)
-- `qmd_get` - Retrieve document by path or docid (with fuzzy matching suggestions)
-- `qmd_multi_get` - Retrieve multiple documents by glob pattern, list, or docids
-- `qmd_status` - Index health and collection info
+- `search` - Fast BM25 keyword search (supports collection filter)
+- `vsearch` - Semantic vector search (supports collection filter)
+- `query` - Hybrid search with reranking (supports collection filter)
+- `get` - Retrieve document by path or docid (with fuzzy matching suggestions)
+- `multi_get` - Retrieve multiple documents by glob pattern, list, or docids
+- `status` - Index health and collection info
+- `ask` - Agentic RAG: returns `{ status, answer?, citations, trace? }`
+
+**ask tool parameters (high-level):**
+- `query` (string)
+- `collection` (optional string)
+- `limit` (optional number)
+- `maxSteps` (optional number)
+- `context` (optional string)
+- `dryRun` (optional boolean)
+- `explain` (optional boolean)
+- `minScore` (optional number)
+- `bridgeCandidates` (optional number)
 
 **Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 

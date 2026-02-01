@@ -965,22 +965,26 @@ Final Output:`;
     if (this.llama) {
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
       try {
-        const disposePromise = this.llama.dispose();
         const timeoutPromise = new Promise<"timeout">((resolve) => {
           timeoutId = setTimeout(() => resolve("timeout"), disposeTimeoutMs);
           timeoutId.unref();
         });
 
-        const winner = await Promise.race([
-          disposePromise.then(() => "disposed" as const).catch(() => "error" as const),
-          timeoutPromise,
-        ]);
+        const disposePromise = (async () => {
+          try {
+            await this.llama!.dispose();
+            return "disposed" as const;
+          } catch (err) {
+            console.error("Failed to dispose llama:", err);
+            return "error" as const;
+          }
+        })();
+
+        const winner = await Promise.race([disposePromise, timeoutPromise]);
 
         if (winner === "timeout") {
           console.error(`llama.dispose() timed out after ${disposeTimeoutMs}ms; continuing shutdown`);
         }
-      } catch (err) {
-        console.error("Failed to dispose llama:", err);
       } finally {
         if (timeoutId) {
           clearTimeout(timeoutId);

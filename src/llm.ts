@@ -55,7 +55,7 @@ function setCEnvIfMissing(name: string, value: string): void {
 
   if (_libc) {
     _libc.symbols.setenv(_cstr(name), _cstr(value), 0);
-  } else if (process.env[name] === undefined) {
+  } else if (process.env[name] === undefined || process.env[name] === "") {
     process.env[name] = value;
   }
 }

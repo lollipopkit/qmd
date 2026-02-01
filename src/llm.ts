@@ -961,20 +961,30 @@ Final Output:`;
     const disposeTimeoutMs = Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 10_000;
 
     // Note: llama.dispose() can hang indefinitely in some environments; use a timeout.
+    // Ensure the timeout doesn't keep the process alive.
     if (this.llama) {
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
       try {
         const disposePromise = this.llama.dispose();
-        const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, disposeTimeoutMs));
+        const timeoutPromise = new Promise<"timeout">((resolve) => {
+          timeoutId = setTimeout(() => resolve("timeout"), disposeTimeoutMs);
+          timeoutId.unref();
+        });
+
         const winner = await Promise.race([
           disposePromise.then(() => "disposed" as const).catch(() => "error" as const),
-          timeoutPromise.then(() => "timeout" as const),
+          timeoutPromise,
         ]);
+
         if (winner === "timeout") {
           console.error(`llama.dispose() timed out after ${disposeTimeoutMs}ms; continuing shutdown`);
         }
       } catch (err) {
         console.error("Failed to dispose llama:", err);
       } finally {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
         this.llama = null;
       }
     }
